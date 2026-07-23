@@ -8,8 +8,8 @@ const { Pool } = pg;
 const PGHOST = process.env.PGHOST || 'localhost';
 const PGPORT = parseInt(process.env.PGPORT || '5432');
 const PGUSER = process.env.PGUSER || 'postgres';
-const PGPASSWORD = process.env.PGPASSWORD || 'postgres'; // standard local password or change as needed
-const PGDATABASE = process.env.PGDATABASE || 'postgres'; // default db
+const PGPASSWORD = process.env.PGPASSWORD || '';
+const PGDATABASE = process.env.PGDATABASE || 'postgres';
 
 console.log(`🔌 Connecting to PostgreSQL at ${PGUSER}@${PGHOST}:${PGPORT}/${PGDATABASE}`);
 

@@ -163,7 +163,8 @@ async function connectToWhatsApp() {
 
 	const sock = makeWASocket({
 		auth: state,
-		printQRInTerminal: false, // Disable QR code print
+		// Disable QR terminal printing on VPS; prefer numeric pairing codes.
+		printQRInTerminal: false,
 		logger: pino({ level: 'silent' }),
 		browser: ['Ubuntu', 'Chrome', '20.0.04']
 	});
@@ -177,17 +178,30 @@ async function connectToWhatsApp() {
 		const { connection, lastDisconnect, qr } = update;
 
 		if (connection === 'connecting' && !state.creds.registered) {
-			try {
-				// Request pairing code from WhatsApp Web servers
-				setTimeout(async () => {
-					const code = await sock.requestPairingCode(phoneNumber);
-					console.log(`\n🔑 [CÓDIGO DE VINCULACIÓN WHATSAPP]: ${code}\n`);
-					console.log(`Introduce este código de 8 dígitos en la app de tu celular:`);
-					console.log(`Ajustes > Dispositivos vinculados > Vincular un dispositivo > Vincular con el número de teléfono.\n`);
-				}, 3000);
-			} catch (err) {
-				console.error('❌ Error al solicitar código de vinculación:', err);
-			}
+			// Try to request a numeric pairing code repeatedly (some servers/timeouts may reject first attempts)
+			const maxAttempts = 6;
+			const delayMs = 4000;
+			(async () => {
+				for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+					try {
+						const code = await sock.requestPairingCode(phoneNumber);
+						console.log(`\n🔑 [CÓDIGO DE VINCULACIÓN WHATSAPP] (intento ${attempt}/${maxAttempts}): ${code}\n`);
+						console.log('Introduce este código de 8 dígitos en la app de tu celular:');
+						console.log('Ajustes > Dispositivos vinculados > Vincular un dispositivo > Vincular con el número de teléfono.\n');
+						break;
+					} catch (err) {
+						const msg = err?.output?.payload?.message || err?.toString();
+						console.error(`❌ Error solicitando código (intento ${attempt}):`, msg);
+						if (attempt < maxAttempts) await new Promise((r) => setTimeout(r, delayMs));
+						else console.error('❌ No fue posible obtener código de vinculación después de varios intentos.');
+					}
+				}
+			})();
+		}
+
+		if (qr) {
+			console.log('\n🔳 QR para escanear (terminal):\n');
+			console.log(qr);
 		}
 
 		if (connection === 'close') {
