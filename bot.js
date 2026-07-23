@@ -2,6 +2,7 @@ import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeys
 import pino from 'pino';
 import fs from 'fs';
 import path from 'path';
+import { spawn } from 'child_process';
 
 function loadDotenvFile(filePath) {
 	if (!fs.existsSync(filePath)) return;
@@ -32,6 +33,128 @@ if (!/^[0-9]+$/.test(BOT_PHONE_NUMBER)) {
 
 // Define temporary path for WhatsApp auth state
 const AUTH_DIR = './whatsapp_session';
+const CHATBOT_API_URL = process.env.CHATBOT_API_URL || 'http://127.0.0.1:5173/api/whatsapp/send';
+let devServerProcess = null;
+let devServerReady = false;
+let devServerStarting = false;
+const processedMessageIds = new Map();
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+
+function getDevServerCommand() {
+	return process.platform === 'win32' ? 'npx.cmd' : 'npx';
+}
+
+async function waitForDevServer(timeoutMs = 30000) {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		try {
+			const response = await fetch('http://127.0.0.1:5173/', { method: 'GET' });
+			if (response.ok || response.status < 500) return true;
+		} catch {
+			// Server still starting up
+		}
+		await new Promise((resolve) => setTimeout(resolve, 1500));
+	}
+	return false;
+}
+
+function isDuplicateMessage(msg) {
+	const messageId = msg?.key?.id;
+	if (!messageId) return false;
+
+	const now = Date.now();
+	const lastSeen = processedMessageIds.get(messageId);
+	if (lastSeen && now - lastSeen < 8000) {
+		return true;
+	}
+
+	processedMessageIds.set(messageId, now);
+	for (const [id, timestamp] of processedMessageIds.entries()) {
+		if (now - timestamp > 20000) {
+			processedMessageIds.delete(id);
+		}
+	}
+
+	return false;
+}
+
+async function ensureChatbotEngineReady() {
+	const alreadyReady = await waitForDevServer(2000);
+	if (alreadyReady) {
+		devServerReady = true;
+		return;
+	}
+
+	if (devServerStarting || devServerProcess) return;
+
+	devServerStarting = true;
+	console.log('🚀 Iniciando motor del chatbot en segundo plano...');
+	const command = getDevServerCommand();
+	devServerProcess = spawn(command, ['vite', 'dev', '--host', '127.0.0.1', '--port', '5173', '--strictPort'], {
+		cwd: process.cwd(),
+		stdio: 'inherit',
+		shell: true
+	});
+
+	devServerProcess.on('exit', (code) => {
+		console.log(`⚠️ El servidor del chatbot terminó con el código: ${code}`);
+		devServerProcess = null;
+		devServerReady = false;
+		devServerStarting = false;
+	});
+
+	const ready = await waitForDevServer(40000);
+	devServerReady = ready;
+	if (!ready) {
+		console.error('❌ No fue posible levantar el motor del chatbot en http://127.0.0.1:5173');
+	}
+	devServerStarting = false;
+}
+
+async function sendToChatbotEngine(payload) {
+	await ensureChatbotEngineReady();
+
+	const response = await fetch(CHATBOT_API_URL, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(payload)
+	});
+
+	const rawBody = await response.text();
+	let data;
+	try {
+		data = JSON.parse(rawBody);
+	} catch {
+		data = { raw: rawBody };
+	}
+
+	console.log(`🧠 Respuesta del motor (${response.status}):`, data);
+
+	if (!response.ok) {
+		throw new Error(`Motor del chatbot respondió con ${response.status}: ${rawBody}`);
+	}
+
+	return data;
+}
+
+function clearSessionAndReconnect(delayMs = 8000) {
+	if (reconnectTimer) {
+		clearTimeout(reconnectTimer);
+	}
+
+	if (fs.existsSync(AUTH_DIR)) {
+		fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+	}
+
+	console.log('🧹 Sesión de WhatsApp limpiada por conflicto o sesión inválida.');
+	console.log('🔁 Intentando volver a vincular el número en unos segundos...');
+
+	reconnectTimer = setTimeout(() => {
+		reconnectTimer = null;
+		connectToWhatsApp();
+	}, delayMs);
+}
 
 async function connectToWhatsApp() {
 	console.log('🔌 Inicializando socket de WhatsApp (Baileys)...');
@@ -68,30 +191,42 @@ async function connectToWhatsApp() {
 		}
 
 		if (connection === 'close') {
-			const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+			const statusCode = lastDisconnect?.error?.output?.statusCode;
+			const message = lastDisconnect?.error?.message || '';
+			const isConflict = statusCode === DisconnectReason.connectionReplaced || statusCode === 440 || message.includes('conflict') || message.includes('replaced');
+			const isUnauthorized = statusCode === 401 || message.includes('Unauthorized') || message.includes('Connection Failure');
+			const shouldReconnect = statusCode !== DisconnectReason.loggedOut && !isConflict && !isUnauthorized;
 			console.log('❌ Conexión cerrada debido a:', lastDisconnect?.error, '. ¿Reconectar?:', shouldReconnect);
 			
-			if (shouldReconnect) {
+			if (isConflict || isUnauthorized) {
+				console.log('⚠️ Sesión de WhatsApp inválida o rechazada. Se limpiará la sesión actual para volver a vincular el número.');
+				clearSessionAndReconnect(8000);
+			} else if (shouldReconnect && reconnectAttempts < 2) {
+				reconnectAttempts += 1;
 				console.log('🔄 Reintentando conexión en 5 segundos...');
-				setTimeout(connectToWhatsApp, 5000);
+				reconnectTimer = setTimeout(() => {
+					reconnectTimer = null;
+					connectToWhatsApp();
+				}, 5000);
 			} else {
-				console.log('🗑️ Sesión cerrada por el usuario. Limpiando credenciales...');
+				console.log('🗑️ Sesión cerrada por el usuario o sin reconexión posible. Limpiando credenciales...');
 				if (fs.existsSync(AUTH_DIR)) {
 					fs.rmSync(AUTH_DIR, { recursive: true, force: true });
 				}
 				process.exit(0);
 			}
 		} else if (connection === 'open') {
+			reconnectAttempts = 0;
 			console.log('✅ ¡Sesión de WhatsApp establecida con éxito!');
 		}
 	});
 
 	// Listen for incoming messages
 	sock.ev.on('messages.upsert', async (m) => {
-		if (m.type !== 'notify') return;
+		if (!m?.messages?.length) return;
 
 		for (const msg of m.messages) {
-			if (msg.key.fromMe || !msg.message) continue;
+			if (msg.key.fromMe || !msg.message || msg.message.protocolMessage) continue;
 
 			const sender = msg.key.remoteJid;
 			const senderNumber = sender.replace('@s.whatsapp.net', '');
@@ -106,27 +241,26 @@ async function connectToWhatsApp() {
 			}
 
 			if (!text.trim()) continue;
+			if (isDuplicateMessage(msg)) {
+				console.log(`↩️ Ignorando mensaje duplicado de ${contactName} (${senderNumber})`);
+				continue;
+			}
 
 			console.log(`📥 Mensaje recibido de ${contactName} (${senderNumber}): ${text}`);
 
 			try {
-				// Send to SvelteKit server chatbot engine API
-				const response = await fetch('http://localhost:5173/api/whatsapp/send', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({
-						message: text,
-						whatsappNumber: senderNumber,
-						contactName,
-						messageType: 'text'
-					})
+				const data = await sendToChatbotEngine({
+					message: text,
+					whatsappNumber: senderNumber,
+					contactName,
+					messageType: 'text'
 				});
-
-				const data = await response.json();
 
 				if (data.success && data.result) {
 					console.log(`📤 Enviando respuesta a ${senderNumber}: ${data.result.text}`);
 					await sock.sendMessage(sender, { text: data.result.text });
+				} else {
+					console.warn(`⚠️ El motor del chatbot no devolvió una respuesta válida para ${senderNumber}:`, data);
 				}
 			} catch (error) {
 				console.error('❌ Error al procesar mensaje con el motor:', error);
