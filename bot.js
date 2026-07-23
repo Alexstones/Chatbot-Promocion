@@ -3,18 +3,46 @@ import pino from 'pino';
 import fs from 'fs';
 import path from 'path';
 
+function loadDotenvFile(filePath) {
+	if (!fs.existsSync(filePath)) return;
+	const contents = fs.readFileSync(filePath, 'utf8');
+	for (const line of contents.split(/\r?\n/)) {
+		const trimmed = line.trim();
+		if (!trimmed || trimmed.startsWith('#')) continue;
+		const [key, ...rest] = trimmed.split('=');
+		if (!key) continue;
+		const value = rest.join('=').trim();
+		if (value === '' || key in process.env) continue;
+		process.env[key] = value;
+	}
+}
+
+const envPath = path.resolve(process.cwd(), '.env');
+loadDotenvFile(envPath);
+
+const BOT_PHONE_NUMBER = process.env.BOT_PHONE_NUMBER?.trim();
+if (!BOT_PHONE_NUMBER) {
+	console.error('❌ BOT_PHONE_NUMBER no está definido en .env');
+	process.exit(1);
+}
+
+if (!/^[0-9]+$/.test(BOT_PHONE_NUMBER)) {
+	console.warn('⚠️ BOT_PHONE_NUMBER debe contener solo dígitos, sin + ni espacios.');
+}
+
 // Define temporary path for WhatsApp auth state
 const AUTH_DIR = './whatsapp_session';
 
 async function connectToWhatsApp() {
 	console.log('🔌 Inicializando socket de WhatsApp (Baileys)...');
+	console.log(`🔧 Usando BOT_PHONE_NUMBER: ${BOT_PHONE_NUMBER}`);
 	const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
 	const sock = makeWASocket({
 		auth: state,
 		printQRInTerminal: false, // Disable QR code print
 		logger: pino({ level: 'silent' }),
-		browser: ['Chrome (Linux)', '', ''] // Browser name format
+		browser: ['Ubuntu', 'Chrome', '20.0.04']
 	});
 
 	sock.ev.on('creds.update', saveCreds);
