@@ -163,9 +163,10 @@ async function connectToWhatsApp() {
 
 	const sock = makeWASocket({
 		auth: state,
-		// Disable QR terminal printing on VPS; prefer numeric pairing codes.
-		printQRInTerminal: false,
-		logger: pino({ level: 'silent' }),
+		// Re-enable QR terminal printing so you can scan the QR from your phone over SSH.
+		printQRInTerminal: true,
+		// Increase logger level to help diagnose pairing failures on the VPS.
+		logger: pino({ level: 'info' }),
 		browser: ['Ubuntu', 'Chrome', '20.0.04']
 	});
 
@@ -179,8 +180,9 @@ async function connectToWhatsApp() {
 
 		if (connection === 'connecting' && !state.creds.registered) {
 			// Try to request a numeric pairing code repeatedly (some servers/timeouts may reject first attempts)
-			const maxAttempts = 6;
-			const delayMs = 4000;
+			// Increase attempts and delay to cope with transient ATN/401 issues seen on some VPSes.
+			const maxAttempts = 10;
+			const delayMs = 8000;
 			(async () => {
 				for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 					try {
@@ -190,8 +192,12 @@ async function connectToWhatsApp() {
 						console.log('Ajustes > Dispositivos vinculados > Vincular un dispositivo > Vincular con el número de teléfono.\n');
 						break;
 					} catch (err) {
-						const msg = err?.output?.payload?.message || err?.toString();
-						console.error(`❌ Error solicitando código (intento ${attempt}):`, msg);
+						// Log detailed error payload for diagnosis (statusCode/location/message)
+						try {
+							console.error(`❌ Error solicitando código (intento ${attempt}):`, JSON.stringify(err?.output?.payload || err?.toString()));
+						} catch (logErr) {
+							console.error('❌ Error solicitando código (intento', attempt, '):', err);
+						}
 						if (attempt < maxAttempts) await new Promise((r) => setTimeout(r, delayMs));
 						else console.error('❌ No fue posible obtener código de vinculación después de varios intentos.');
 					}
